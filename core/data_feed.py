@@ -1,26 +1,33 @@
 import asyncio
 import websockets
 import json
+import numpy as np
 from collections import deque
 from services.telegram_service import send_message
 from services.database import Session, TradeBlueprint
-import numpy as np
+
+# ============================
+# GLOBAL STATE
+# ============================
 
 price_1m = {}
 price_5m = {}
 volume_1m = {}
 ranges_1m = {}
 orderbook_ratio = {}
-cooldowns = {}
+
+db_queue = asyncio.Queue()
 
 BASE_MOMENTUM = 0.3
 VOLUME_MULTIPLIER = 1.2
-COOLDOWN_SECONDS = 120
 RSI_PERIOD = 14
 EMA_PERIOD = 20
 IMBALANCE_THRESHOLD_BUY = 1.8
 IMBALANCE_THRESHOLD_SELL = 0.55
 
+# ============================
+# INDICATORS
+# ============================
 
 def calculate_rsi(prices):
     if len(prices) < RSI_PERIOD:
@@ -35,25 +42,48 @@ def calculate_rsi(prices):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-
-def calculate_ema(prices, period):
-    if len(prices) < period:
-        return None
-    return np.mean(prices[-period:])
-
-
 def calculate_volatility(ranges):
     if len(ranges) < 5:
         return 1.5
-    avg_range = np.mean(ranges[-5:])
-    if avg_range < np.mean(ranges) * 0.8:
+    recent = np.mean(ranges[-5:])
+    overall = np.mean(ranges)
+    if recent < overall * 0.8:
         return 1.2
-    elif avg_range > np.mean(ranges) * 1.2:
+    elif recent > overall * 1.2:
         return 2.0
     return 1.5
 
+# ============================
+# SINGLE DB WRITER
+# ============================
+
+async def db_worker():
+    while True:
+        task = await db_queue.get()
+
+        with Session() as session:
+            if task["type"] == "new_trade":
+                session.add(TradeBlueprint(**task["data"]))
+
+            elif task["type"] == "update_trade":
+                trade = session.query(TradeBlueprint).filter_by(
+                    id=task["id"]
+                ).first()
+
+                if trade:
+                    trade.status = "closed"
+                    trade.outcome = task["outcome"]
+                    trade.exit_price = task["exit_price"]
+                    trade.pnl_pct = task["pnl_pct"]
+
+            session.commit()
+
+# ============================
+# STREAM SYMBOL
+# ============================
 
 async def stream_symbol(symbol):
+
     url_1m = f"wss://fstream.binance.com/ws/{symbol}@kline_1m"
     url_5m = f"wss://fstream.binance.com/ws/{symbol}@kline_5m"
     url_depth = f"wss://fstream.binance.com/ws/{symbol}@depth20@100ms"
@@ -63,195 +93,229 @@ async def stream_symbol(symbol):
     volume_1m[symbol] = deque(maxlen=20)
     ranges_1m[symbol] = deque(maxlen=20)
     orderbook_ratio[symbol] = 1
-    cooldowns[symbol] = 0
 
-    async def stream_depth():
-        async with websockets.connect(url_depth) as ws:
-            while True:
-                msg = json.loads(await ws.recv())
-                bids = msg["b"]
-                asks = msg["a"]
-                bid_volume = sum(float(b[1]) for b in bids)
-                ask_volume = sum(float(a[1]) for a in asks)
-                if ask_volume != 0:
-                    orderbook_ratio[symbol] = bid_volume / ask_volume
+    # -------------------------
+    # DEPTH STREAM
+    # -------------------------
+
+    async def depth_stream():
+        while True:
+            try:
+                async with websockets.connect(
+                    url_depth,
+                    ping_interval=20,
+                    ping_timeout=20
+                ) as ws:
+
+                    while True:
+                        msg = json.loads(await ws.recv())
+                        bids = msg["b"]
+                        asks = msg["a"]
+
+                        bid_vol = sum(float(b[1]) for b in bids)
+                        ask_vol = sum(float(a[1]) for a in asks)
+
+                        if ask_vol != 0:
+                            orderbook_ratio[symbol] = bid_vol / ask_vol
+
+            except Exception as e:
+                print(f"{symbol} depth reconnecting...", e)
+                await asyncio.sleep(2)
+
+    # -------------------------
+    # 5M STREAM
+    # -------------------------
 
     async def stream_5m():
-        async with websockets.connect(url_5m) as ws:
-            while True:
-                msg = json.loads(await ws.recv())
-                k = msg["k"]
-                if k["x"]:
-                    price_5m[symbol].append(float(k["c"]))
+        while True:
+            try:
+                async with websockets.connect(
+                    url_5m,
+                    ping_interval=20,
+                    ping_timeout=20
+                ) as ws:
+
+                    while True:
+                        msg = json.loads(await ws.recv())
+                        k = msg["k"]
+                        if k["x"]:
+                            price_5m[symbol].append(float(k["c"]))
+
+            except Exception as e:
+                print(f"{symbol} 5m reconnecting...", e)
+                await asyncio.sleep(2)
+
+    # -------------------------
+    # 1M STREAM
+    # -------------------------
 
     async def stream_1m():
-        async with websockets.connect(url_1m) as ws:
-            while True:
-                msg = json.loads(await ws.recv())
-                k = msg["k"]
+        while True:
+            try:
+                async with websockets.connect(
+                    url_1m,
+                    ping_interval=20,
+                    ping_timeout=20
+                ) as ws:
 
-                if k["x"]:
-                    close = float(k["c"])
-                    high = float(k["h"])
-                    low = float(k["l"])
-                    vol = float(k["v"])
+                    while True:
+                        msg = json.loads(await ws.recv())
+                        k = msg["k"]
 
-                    price_1m[symbol].append(close)
-                    volume_1m[symbol].append(vol)
-                    ranges_1m[symbol].append(high - low)
+                        if not k["x"]:
+                            continue
 
-                    session = Session()
-                    open_trade = session.query(TradeBlueprint).filter_by(
-                        symbol=symbol.upper(),
-                        status="open"
-                    ).first()
+                        close = float(k["c"])
+                        high = float(k["h"])
+                        low = float(k["l"])
+                        vol = float(k["v"])
 
-                    if open_trade:
-                        if open_trade.direction == "LONG":
-                            if high >= open_trade.tp:
-                                open_trade.status = "closed"
-                                open_trade.outcome = "win"
-                                open_trade.exit_price = open_trade.tp
-                                open_trade.pnl_pct = ((open_trade.tp - open_trade.entry) / open_trade.entry) * 100
+                        price_1m[symbol].append(close)
+                        volume_1m[symbol].append(vol)
+                        ranges_1m[symbol].append(high - low)
 
-                                send_message(
-                                    f"✅ TP HIT\n"
-                                    f"{symbol.upper()} LONG\n"
-                                    f"PnL: {open_trade.pnl_pct:.2f}%"
-                                )
+                        if len(price_1m[symbol]) < 6:
+                            continue
 
-                            elif low <= open_trade.stop:
-                                open_trade.status = "closed"
-                                open_trade.outcome = "loss"
-                                open_trade.exit_price = open_trade.stop
-                                open_trade.pnl_pct = ((open_trade.stop - open_trade.entry) / open_trade.entry) * 100
+                        # -------------------------
+                        # CHECK OPEN TRADE
+                        # -------------------------
 
-                                send_message(
-                                    f"❌ SL HIT\n"
-                                    f"{symbol.upper()} LONG\n"
-                                    f"PnL: {open_trade.pnl_pct:.2f}%"
-                                )
+                        with Session() as session:
+                            open_trade = session.query(TradeBlueprint).filter_by(
+                                symbol=symbol.upper(),
+                                status="open"
+                            ).first()
 
-                        elif open_trade.direction == "SHORT":
-                            if low <= open_trade.tp:
-                                open_trade.status = "closed"
-                                open_trade.outcome = "win"
-                                open_trade.exit_price = open_trade.tp
-                                open_trade.pnl_pct = ((open_trade.entry - open_trade.tp) / open_trade.entry) * 100
+                        if open_trade:
 
-                                send_message(
-                                    f"✅ TP HIT\n"
-                                    f"{symbol.upper()} SHORT\n"
-                                    f"PnL: {open_trade.pnl_pct:.2f}%"
-                                )
+                            if open_trade.direction == "LONG":
+                                if high >= open_trade.tp:
+                                    pnl = ((open_trade.tp - open_trade.entry) / open_trade.entry) * 100
+                                    await db_queue.put({
+                                        "type": "update_trade",
+                                        "id": open_trade.id,
+                                        "outcome": "win",
+                                        "exit_price": open_trade.tp,
+                                        "pnl_pct": pnl
+                                    })
+                                    send_message(f"✅ TP HIT {symbol.upper()} LONG | {pnl:.2f}%")
 
-                            elif high >= open_trade.stop:
-                                open_trade.status = "closed"
-                                open_trade.outcome = "loss"
-                                open_trade.exit_price = open_trade.stop
-                                open_trade.pnl_pct = ((open_trade.entry - open_trade.stop) / open_trade.entry) * 100
+                                elif low <= open_trade.stop:
+                                    pnl = ((open_trade.stop - open_trade.entry) / open_trade.entry) * 100
+                                    await db_queue.put({
+                                        "type": "update_trade",
+                                        "id": open_trade.id,
+                                        "outcome": "loss",
+                                        "exit_price": open_trade.stop,
+                                        "pnl_pct": pnl
+                                    })
+                                    send_message(f"❌ SL HIT {symbol.upper()} LONG | {pnl:.2f}%")
 
-                                send_message(
-                                    f"❌ SL HIT\n"
-                                    f"{symbol.upper()} SHORT\n"
-                                    f"PnL: {open_trade.pnl_pct:.2f}%"
-                                )
+                            elif open_trade.direction == "SHORT":
+                                if low <= open_trade.tp:
+                                    pnl = ((open_trade.entry - open_trade.tp) / open_trade.entry) * 100
+                                    await db_queue.put({
+                                        "type": "update_trade",
+                                        "id": open_trade.id,
+                                        "outcome": "win",
+                                        "exit_price": open_trade.tp,
+                                        "pnl_pct": pnl
+                                    })
+                                    send_message(f"✅ TP HIT {symbol.upper()} SHORT | {pnl:.2f}%")
 
-                        session.commit()
+                                elif high >= open_trade.stop:
+                                    pnl = ((open_trade.entry - open_trade.stop) / open_trade.entry) * 100
+                                    await db_queue.put({
+                                        "type": "update_trade",
+                                        "id": open_trade.id,
+                                        "outcome": "loss",
+                                        "exit_price": open_trade.stop,
+                                        "pnl_pct": pnl
+                                    })
+                                    send_message(f"❌ SL HIT {symbol.upper()} SHORT | {pnl:.2f}%")
 
-                    session.close()
+                            continue  # do not open new trade if one exists
 
+                        # -------------------------
+                        # SIGNAL GENERATION
+                        # -------------------------
 
-                    if len(price_1m[symbol]) < 6:
-                        continue
+                        recent_prices = list(price_1m[symbol])
+                        recent_ranges = list(ranges_1m[symbol])
 
-                    session = Session()
-                    existing = session.query(TradeBlueprint).filter_by(
-                        symbol=symbol.upper(),
-                        status="open"
-                    ).first()
+                        old_price = recent_prices[-3]
+                        change_pct = ((close - old_price) / old_price) * 100
 
-                    if existing:
-                        session.close()
-                        continue
+                        avg_vol = sum(volume_1m[symbol]) / len(volume_1m[symbol])
+                        rsi = calculate_rsi(recent_prices)
 
-                    old_price = price_1m[symbol][-3]
-                    change_pct = ((close - old_price) / old_price) * 100
+                        if rsi is None:
+                            continue
 
-                    avg_vol = sum(volume_1m[symbol]) / len(volume_1m[symbol])
-                    rsi = calculate_rsi(list(price_1m[symbol]))
-                    ema_5m = calculate_ema(list(price_5m[symbol]), EMA_PERIOD)
+                        imbalance = orderbook_ratio[symbol]
 
-                    if rsi is None:
-                        session.close()
-                        continue
+                        if (
+                            abs(change_pct) >= BASE_MOMENTUM
+                            and vol > avg_vol * VOLUME_MULTIPLIER
+                            and (
+                                (change_pct > 0 and rsi > 52 and imbalance > IMBALANCE_THRESHOLD_BUY)
+                                or
+                                (change_pct < 0 and rsi < 48 and imbalance < IMBALANCE_THRESHOLD_SELL)
+                            )
+                        ):
+                            direction = "LONG" if change_pct > 0 else "SHORT"
 
-                    direction = "LONG" if change_pct > 0 else "SHORT"
+                            recent_high = max(recent_prices[-5:])
+                            recent_low = min(recent_prices[-5:])
+                            buffer = np.mean(recent_ranges[-5:]) * 0.5
 
-                    ema_valid = True if ema_5m is None else (
-                        (change_pct > 0 and close > ema_5m) or
-                        (change_pct < 0 and close < ema_5m)
-                    )
+                            if direction == "LONG":
+                                stop = recent_low - buffer
+                                risk = close - stop
+                            else:
+                                stop = recent_high + buffer
+                                risk = stop - close
 
-                    imbalance = orderbook_ratio[symbol]
-                    imbalance_valid = (
-                        (change_pct > 0 and imbalance > IMBALANCE_THRESHOLD_BUY) or
-                        (change_pct < 0 and imbalance < IMBALANCE_THRESHOLD_SELL)
-                    )
+                            rr = calculate_volatility(recent_ranges)
 
-                    if (
-                        abs(change_pct) >= BASE_MOMENTUM
-                        and vol > avg_vol * VOLUME_MULTIPLIER
-                        and ((change_pct > 0 and rsi > 52) or (change_pct < 0 and rsi < 48))
-                        and ema_valid
-                        and imbalance_valid
-                    ):
-                        recent_high = max(price_1m[symbol][-5:])
-                        recent_low = min(price_1m[symbol][-5:])
-                        buffer = np.mean(ranges_1m[symbol][-5:]) * 0.5
+                            if direction == "LONG":
+                                tp = close + risk * rr
+                            else:
+                                tp = close - risk * rr
 
-                        if direction == "LONG":
-                            stop = recent_low - buffer
-                            risk = close - stop
-                        else:
-                            stop = recent_high + buffer
-                            risk = stop - close
+                            confidence = min(abs(change_pct) * 60 + (imbalance * 5), 100)
 
-                        rr_multiplier = calculate_volatility(ranges_1m[symbol])
+                            await db_queue.put({
+                                "type": "new_trade",
+                                "data": {
+                                    "symbol": symbol.upper(),
+                                    "direction": direction,
+                                    "entry": close,
+                                    "stop": stop,
+                                    "tp": tp,
+                                    "rr": rr,
+                                    "confidence": confidence,
+                                    "status": "open"
+                                }
+                            })
 
-                        if direction == "LONG":
-                            tp = close + risk * rr_multiplier
-                        else:
-                            tp = close - risk * rr_multiplier
+                            send_message(
+                                f"🚨 TRADE BLUEPRINT\n"
+                                f"{symbol.upper()} {direction}\n"
+                                f"Entry: {close:.4f}\n"
+                                f"Stop: {stop:.4f}\n"
+                                f"TP: {tp:.4f}\n"
+                                f"RR: {rr:.2f}\n"
+                                f"Confidence: {confidence:.0f}/100"
+                            )
 
-                        rr = rr_multiplier
+            except Exception as e:
+                print(f"{symbol} 1m reconnecting...", e)
+                await asyncio.sleep(2)
 
-                        confidence = min(abs(change_pct) * 60 + (imbalance * 5), 100)
-
-                        alert = (
-                            f"🚨 TRADE BLUEPRINT\n"
-                            f"Symbol: {symbol.upper()}\n"
-                            f"Direction: {direction}\n\n"
-                            f"Entry: {close:.4f}\n"
-                            f"Stop: {stop:.4f}\n"
-                            f"Target: {tp:.4f}\n"
-                            f"RR: {rr:.2f}\n\n"
-                            f"Confidence: {confidence:.0f}/100"
-                        )
-
-                        send_message(alert)
-
-                        session.add(TradeBlueprint(
-                            symbol=symbol.upper(),
-                            direction=direction,
-                            entry=close,
-                            stop=stop,
-                            tp=tp,
-                            rr=rr,
-                            confidence=confidence,
-                            status="open"
-                        ))
-                        session.commit()
-                        session.close()
-
-    await asyncio.gather(stream_depth(), stream_5m(), stream_1m())
+    await asyncio.gather(
+        depth_stream(),
+        stream_5m(),
+        stream_1m()
+    )

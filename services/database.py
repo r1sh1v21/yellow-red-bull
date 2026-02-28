@@ -1,14 +1,18 @@
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import NullPool
 
 engine = create_engine(
     "sqlite:///db/bot.db",
     connect_args={"check_same_thread": False},
-    poolclass=None
+    poolclass=NullPool  
 )
-Base = declarative_base()
+
 Session = sessionmaker(bind=engine)
+Base = declarative_base()
 
 
 
