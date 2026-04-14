@@ -1,4 +1,4 @@
-# // Systematic Alpha: High-Frequency Execution Pipeline
+# Systematic Alpha: High-Frequency Execution Pipeline
 
 ### [ Internal Documentation / Private ]
 Code is proprietary. If you're from a fund, you already know why. This is the architectural breakdown of how I’m handling signal decay and regime switching in high-entropy markets without a server farm.
@@ -10,7 +10,7 @@ Most retail bots fail because they treat market data as a static prediction task
 
 I’ve engineered a workaround for the "Infra Gap" by utilizing **Multi-Modal Feature Fusion** and **Fractional Differentiation** to isolate alpha from stochastic noise.
 
-## // The Architecture (The "Brain")
+## // The Architecture
 
 ### 1. Inhaling the Stream (Data Modalities)
 I’m moving beyond simple price action. The engine ingests:
