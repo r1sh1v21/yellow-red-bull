@@ -40,10 +40,25 @@ Validated via **Purged and Embargoed Cross-Validation** to kill look-ahead bias.
 | **Max Drawdown (MDD)** | **7.2%** |
 | **Profit Factor** | **1.58** |
 
-<img width="3600" height="1800" alt="equity_curve" src="https://github.com/user-attachments/assets/355f38e9-ae41-4201-91b4-18f8ee9ee24a" />
+<img width="1800" height="1800" alt="equity_curve" src="https://github.com/user-attachments/assets/355f38e9-ae41-4201-91b4-18f8ee9ee24a" />
 
-<img width="3000" height="1800" alt="feature_importance" src="https://github.com/user-attachments/assets/80fa864c-ac6f-4934-9dd8-93e2f9e816ce" />
+<img width="1800" height="1800" alt="feature_importance" src="https://github.com/user-attachments/assets/80fa864c-ac6f-4934-9dd8-93e2f9e816ce" />
 
+## // Current Sprint: Solving the Information Bottleneck
+
+The primary bottleneck right now isn't the model's accuracy—it's **Signal Decay (Alpha Decay)** during regime transitions. In high-entropy environments, the "Information Ratio" collapses faster than the execution engine can recalibrate. 
+
+### The Problem:
+Most retail-grade setups suffer from **Adverse Selection** during these flips. Big-league HFT firms mitigate this with custom FPGA hardware and direct-market-access (DMA) to detect microstructure shifts in sub-microseconds.
+
+<img width="2600" height="1500" alt="regime_detection" src="https://github.com/user-attachments/assets/4d79d8ff-e32d-4e95-8f2d-cf65b1f6648e" />
+
+
+### My Approach:
+I'm currently implementing a **Self-Correcting Bayesian Feedback Loop** to adjust the weights of the LSTM latent context in real-time. Instead of needing 100 servers to monitor every tick, I’m utilizing **Entropy-Based Feature Pruning** to identify when a feature (like 5m RSI) has turned into pure noise.
+
+**Status:** - Successfully decoupled the "Regime Filter" from the primary decision core. 
+- Inference latency is currently the enemy—trying to keep the Bayesian update under 50ms on a single-thread Python environment. It’s tight, but the math holds.
 
 **// Contact**
 If you want to talk architecture, regime-switching, or how to bridge the latency gap—dm me.
